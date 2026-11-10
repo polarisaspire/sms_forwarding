@@ -1766,9 +1766,18 @@ static bool model_skips_cgact(void)
 }
 
 static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint32_t active_timeout_ms,
-                                            uint32_t inactive_timeout_ms)
+                                            uint32_t inactive_timeout_ms, bool* deferred = nullptr)
 {
+    if (deferred) *deferred = false;
     std::string resp;
+    // ML307A 初始化阶段状态尚未稳定，PDP 配置延后到完成驻网后执行。
+    // 必须查询本次真实注册状态，不能沿用硬重启前的缓存；注册后由后台重试应用配置。
+    int registration = -1;
+    if (!send_ok("AT+CEREG?", 1200, &resp) || !parse_cereg(resp, registration)) return false;
+    if (registration != 1 && registration != 5) {
+        if (deferred) *deferred = true;
+        return false;
+    }
     std::string apn = idf_util_trim_copy(cfg.apn);
     // 数据漫游策略：未勾选"允许数据漫游"且当前处于漫游(CEREG=5)时不激活蜂窝数据。
     // 启动阶段注册状态未知(stat=-1)会乐观激活，注册完成后由 enforce_roaming_data_policy 兜底关闭。
@@ -1866,9 +1875,15 @@ static bool process_data_mode_retry(void)
     if (static_cast<int32_t>(xTaskGetTickCount() - s_next_data_mode_retry) < 0) return false;  // 回绕安全
     if (!at_channel_idle_now()) return false;
 
-    ++s_data_mode_retry_count;
     IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
-    bool ok = apply_configured_data_mode_once(cfg, 8000, 3000);
+    bool deferred = false;
+    bool ok = apply_configured_data_mode_once(cfg, 8000, 3000, &deferred);
+    // 等待驻网不消耗 PDP 命令失败额度，慢注册完成后仍要应用用户的数据开关。
+    if (deferred) {
+        s_next_data_mode_retry = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS);
+        return true;
+    }
+    ++s_data_mode_retry_count;
     if (ok) {
         s_data_mode_retry_pending = false;
         idf_log_line(cfg.dataEnabled ? "后台重试：蜂窝数据已启用" : "后台重试：蜂窝数据已禁用");
@@ -2429,9 +2444,77 @@ static bool query_sim_present(void)
 }
 
 // 重启后 AT 握手失败时置位：一旦后续任何探测发现 AT 恢复，立即补跑完整初始化
-// (ATE0/CMGF/CNMI/CEREG/CGACT)。否则模组以默认配置运行——回显开着、URC 不上报、
+// (CFUN/ATE0/CMGF/CNMI/CEREG/CGACT)。否则模组以默认配置运行——回显开着、URC 不上报、
 // 数据连接按模组默认自动激活(产生流量费，恰是本项目要防止的)。
 static bool s_reinit_pending = false;
+static bool s_radio_startup_pending = true;
+static TickType_t s_next_radio_startup_check = 0;
+
+static bool parse_cfun(const std::string& response, int& mode)
+{
+    size_t pos = response.find("+CFUN:");
+    if (pos == std::string::npos) return false;
+    std::string line = line_containing(response, pos);
+    size_t colon = line.find(':');
+    long value = -1;
+    if (colon == std::string::npos || !parse_long_token(line.substr(colon + 1), value) ||
+        value < 0 || value > 255) return false;
+    mode = static_cast<int>(value);
+    return true;
+}
+
+// 仅在启动/复位后的初始化入口恢复射频，正常健康轮询不覆盖用户手动飞行模式。
+// 部分 ML307A 的冷启动默认 CFUN=0，能读 SIM/响应 AT 不代表射频已开启。
+static bool ensure_modem_radio_ready(bool restore_flight_mode = true)
+{
+    std::string response;
+    int mode = -1;
+    if (!send_ok("AT+CFUN?", 1500, &response) || !parse_cfun(response, mode)) {
+        idf_log_line("初始化射频状态未确认，保留待恢复任务");
+        return false;
+    }
+    if (mode == 1 || (mode == 4 && !restore_flight_mode)) return true;
+    if (mode != 0 && mode != 4) {
+        idf_logf("初始化射频状态 CFUN=%d 未支持自动恢复", mode);
+        return false;
+    }
+    idf_logf("模组射频 CFUN=%d，恢复完整功能", mode);
+    if (!send_ok("AT+CFUN=1", 10000)) {
+        idf_log_line("开启射频失败，保留待恢复任务");
+        return false;
+    }
+    if (!send_ok("AT+CFUN?", 2000, &response) || !parse_cfun(response, mode) || mode != 1) {
+        idf_log_line("射频开启尚未确认，保留待恢复任务");
+        return false;
+    }
+    idf_log_line("模组射频已恢复 CFUN=1，开始网络注册");
+    // 射频重新开启可能重新激活默认 PDP，稳定驻网后再次应用用户数据开关。
+    if (!restore_flight_mode) schedule_data_mode_retry();
+    return true;
+}
+
+
+// 上电早期 CFUN=1 的即时确认不足：异步初始化仍可能再回落到 0。
+// 仅首次驻网前持续确认；运行中用户设置的 CFUN=4 不受此恢复干预。
+static void recover_startup_radio_if_pending(int registration)
+{
+    if (!s_radio_startup_pending) return;
+    if (registration == 1 || registration == 5) {
+        s_radio_startup_pending = false;
+        return;
+    }
+    ensure_modem_radio_ready(false);
+}
+
+// SIM 查询暂时报错时也必须能恢复射频，不能依赖 sim_ready 才进入 CEREG 路径。
+static void process_startup_radio_recovery(void)
+{
+    if (!s_radio_startup_pending || !at_channel_idle_now()) return;
+    TickType_t now = xTaskGetTickCount();
+    if (static_cast<int32_t>(now - s_next_radio_startup_check) < 0) return;
+    s_next_radio_startup_check = now + pdMS_TO_TICKS(5000);
+    recover_startup_radio_if_pending(-1);
+}
 
 static bool handle_reset_request_if_any(void)
 {
@@ -2440,6 +2523,7 @@ static bool handle_reset_request_if_any(void)
     if (s_esim_operation_depth.load(std::memory_order_relaxed) != 0) return false;
     int request = s_reset_request.exchange(0, std::memory_order_relaxed);
     if (request == 0) return false;
+    s_radio_startup_pending = true;
 
     IdfModemStatus patch;
     patch.phase = "powering";
@@ -2468,6 +2552,11 @@ static bool handle_reset_request_if_any(void)
     patch.modemReady = false;
     patch.phase = "at_ready";
     update_status(patch);
+    if (!ensure_modem_radio_ready()) {
+        s_reinit_pending = true;
+        set_phase("failed");
+        return true;
+    }
     if (try_unlock_sim(false)) {
         configure_sms_and_registration();
         set_phase("registering");
@@ -2483,6 +2572,7 @@ static void run_pending_reinit_if_recovered(void)
     if (!s_reinit_pending) return;
     if (!at_channel_idle_now()) return;
     if (!send_ok("AT", 700)) return;
+    s_radio_startup_pending = true;
     idf_log_line("模组 AT 已恢复，补跑短信/注册/数据配置");
     IdfModemStatus patch;
     patch.started = true;
@@ -2490,6 +2580,7 @@ static void run_pending_reinit_if_recovered(void)
     patch.modemReady = false;
     patch.phase = "at_ready";
     update_status(patch);
+    if (!ensure_modem_radio_ready()) return;
     if (try_unlock_sim(false)) {
         configure_sms_and_registration();
         set_phase("registering");
@@ -2556,7 +2647,8 @@ static void modem_task(void*)
     ESP_LOGI(TAG, "AT 已就绪");
     idf_log_line("模组 AT 已就绪");
 
-    bool sim_ready = try_unlock_sim(false);
+    s_reinit_pending = !ensure_modem_radio_ready();
+    bool sim_ready = !s_reinit_pending && try_unlock_sim(false);
     TickType_t last_sim_unlock_check = xTaskGetTickCount();
     uint8_t sim_unlock_retry_level = 0;
     if (sim_ready) {
@@ -2570,6 +2662,7 @@ static void modem_task(void*)
     while (sim_ready && check_count++ < 30) {
         std::string resp;
         if (send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat)) {
+            recover_startup_radio_if_pending(stat);
             IdfModemStatus reg_patch;
             reg_patch.ceregStat = stat;
             reg_patch.phase = (stat == 1 || stat == 5) ? "sampling" : "registering";
@@ -2615,6 +2708,7 @@ static void modem_task(void*)
     while (true) {
         bool reset_handled = handle_reset_request_if_any();
         run_pending_reinit_if_recovered();
+        process_startup_radio_recovery();
         if (!sim_ready && idf_modem_get_status().simState == "ready") sim_ready = true;
         TickType_t now = xTaskGetTickCount();
         if (reset_handled) {
@@ -2738,6 +2832,7 @@ static void modem_task(void*)
             last_health = now;
             std::string resp;
             if (send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat)) {
+                recover_startup_radio_if_pending(stat);
                 health_fail_count = 0;
                 bool now_ready = (stat == 1 || stat == 5);
                 IdfModemStatus reg_patch;

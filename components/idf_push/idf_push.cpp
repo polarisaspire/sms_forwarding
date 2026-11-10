@@ -35,7 +35,8 @@
 #include "esp_idf_version.h"
 #include "mbedtls/base64.h"
 #include "mbedtls/error.h"
-#include "mbedtls/md.h"
+#include "psa/crypto.h"
+#include "idf_push_feishu_response.h"
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ssl.h"
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
@@ -356,19 +357,40 @@ static std::string url_encode(const std::string& value)
 
 static std::string hmac_sha256_base64(const std::string& data, const std::string& key)
 {
-    unsigned char hmac[32] = {};
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
-    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    mbedtls_md_setup(&ctx, info, 1);
-    mbedtls_md_hmac_starts(&ctx, reinterpret_cast<const unsigned char*>(key.data()), key.size());
-    mbedtls_md_hmac_update(&ctx, reinterpret_cast<const unsigned char*>(data.data()), data.size());
-    mbedtls_md_hmac_finish(&ctx, hmac);
-    mbedtls_md_free(&ctx);
-
+    // IDF 6 使用 PSA Crypto；旧 MD/HMAC 接口失败时不能继续编码全零缓冲。
+    psa_status_t status = psa_crypto_init();
+    if (status != PSA_SUCCESS) {
+        idf_logf("推送签名初始化失败 (PSA %ld)", static_cast<long>(status));
+        return {};
+    }
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attributes, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+    psa_key_id_t key_id = 0;
+    status = psa_import_key(&attributes, reinterpret_cast<const uint8_t*>(key.data()),
+                            key.size(), &key_id);
+    psa_reset_key_attributes(&attributes);
+    if (status != PSA_SUCCESS) {
+        idf_logf("推送签名密钥导入失败 (PSA %ld)", static_cast<long>(status));
+        return {};
+    }
+    unsigned char digest[32] = {};
+    size_t digest_len = 0;
+    status = psa_mac_compute(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+                             reinterpret_cast<const uint8_t*>(data.data()), data.size(),
+                             digest, sizeof(digest), &digest_len);
+    psa_destroy_key(key_id);
+    if (status != PSA_SUCCESS || digest_len != sizeof(digest)) {
+        idf_logf("推送签名计算失败 (PSA %ld)", static_cast<long>(status));
+        return {};
+    }
     unsigned char out[64] = {};
     size_t out_len = 0;
-    if (mbedtls_base64_encode(out, sizeof(out), &out_len, hmac, sizeof(hmac)) != 0) return {};
+    if (mbedtls_base64_encode(out, sizeof(out), &out_len, digest, digest_len) != 0) {
+        idf_log_line("推送签名 Base64 编码失败");
+        return {};
+    }
     return std::string(reinterpret_cast<char*>(out), out_len);
 }
 
@@ -669,7 +691,7 @@ static bool http_transport_available()
 
 static esp_err_t http_request(const std::string& url, const char* method,
                               const char* content_type, const std::string& body,
-                              int& status_code)
+                              int& status_code, IdfPushHttpResponse* response = nullptr)
 {
     if (!idf_wifi_get_status().staConnected) {
         const IdfSimSettingsView sim = idf_config_get_sim_settings_view();
@@ -683,6 +705,18 @@ static esp_err_t http_request(const std::string& url, const char* method,
     }
 
     esp_http_client_config_t cfg = {};
+    if (response) {
+        response->supported = true;
+        cfg.user_data = response;
+        cfg.event_handler = [](esp_http_client_event_t* event) -> esp_err_t {
+            if (event->event_id == HTTP_EVENT_ON_DATA && event->data_len > 0) {
+                auto* captured = static_cast<IdfPushHttpResponse*>(event->user_data);
+                captured->append(static_cast<const char*>(event->data),
+                                  static_cast<size_t>(event->data_len));
+            }
+            return ESP_OK;
+        };
+    }
     cfg.url = url.c_str();
     cfg.timeout_ms = HTTP_TIMEOUT_MS;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
@@ -1209,7 +1243,7 @@ static bool send_smtp_email(const IdfEmailSettingsView& cfg, const std::string& 
 
 static bool send_to_channel(const IdfPushChannel& channel, const char* sender_raw,
                             const char* text_raw, const char* timestamp_raw,
-                            bool notify = false)
+                            bool notify = false, std::string* failure = nullptr)
 {
     if (!channel_valid(channel)) return false;
 
@@ -1269,7 +1303,12 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
             if (!channel.key1.empty()) {
                 int64_t ts = utc_millis();
                 std::string sign_data = std::to_string(ts) + "\n" + channel.key1;
-                std::string sign = url_encode(hmac_sha256_base64(sign_data, channel.key1));
+                std::string raw_sign = hmac_sha256_base64(sign_data, channel.key1);
+                if (raw_sign.empty()) {
+                    if (failure) *failure = "签名计算失败，请查看日志";
+                    return false;
+                }
+                std::string sign = url_encode(raw_sign);
                 url += (url.find('?') == std::string::npos ? "?" : "&");
                 url += "timestamp=" + std::to_string(ts) + "&sign=" + sign;
             }
@@ -1327,6 +1366,10 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
                 int64_t ts = time(nullptr);
                 // 飞书签名与钉钉相反: 以 ts+"\n"+secret 为密钥、空串为消息做 HMAC-SHA256
                 std::string sign = hmac_sha256_base64("", std::to_string(ts) + "\n" + channel.key1);
+                if (sign.empty()) {
+                    if (failure) *failure = "飞书签名计算失败，请查看日志";
+                    return false;
+                }
                 body += "\"timestamp\":\"" + std::to_string(ts) + "\",\"sign\":\"" + sign + "\",";
             }
             body += notify
@@ -1359,8 +1402,20 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
 
     std::string name = channel.name.empty() ? ("通道" + std::to_string(channel.type)) : channel.name;
     int code = 0;
-    esp_err_t err = http_request(url, method, content_type, body, code);
+    IdfPushHttpResponse response;
+    esp_err_t err = http_request(url, method, content_type, body, code,
+                                 channel.type == PUSH_TYPE_FEISHU ? &response : nullptr);
     bool ok = (err == ESP_OK && code >= 200 && code < 300);
+    if (ok && channel.type == PUSH_TYPE_FEISHU && response.supported) {
+        int service_code = -1;
+        ok = !response.overflow && idf_push_feishu_response_ok(response.body, service_code);
+        if (!ok) {
+            std::string detail = service_code == -1 ? "飞书响应无效或过长"
+                : "飞书拒绝推送，错误码 " + std::to_string(service_code);
+            idf_logf("%s %s", name.c_str(), detail.c_str());
+            if (failure) *failure = detail;
+        }
+    }
     // 发送中+响应码两行合并为一行结果，降噪同时保留通道名与成败
     if (err == ESP_OK) idf_logf("%s 推送%s (HTTP %d)", name.c_str(), ok ? "成功" : "失败", code);
     else idf_logf("%s 推送失败: %s", name.c_str(), esp_err_to_name(err));
@@ -1839,9 +1894,10 @@ static bool process_test_one()
         s_busy.store(true, std::memory_order_relaxed);
         std::string ts = format_local_time(cfg.tzOffsetMin);
         ok = send_to_channel(channel, "测试", "这是一条来自 SMS Forwarder 的测试推送",
-                             ts.empty() ? "时间未同步" : ts.c_str());
+                             ts.empty() ? "时间未同步" : ts.c_str(), false, &result);
         s_busy.store(false, std::memory_order_relaxed);
-        result = ok ? "测试推送已发送" : "测试推送失败，请查看日志";
+        if (ok) result = "测试推送已发送";
+        else if (result.empty()) result = "测试推送失败，请查看日志";
     }
 
     if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
